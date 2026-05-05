@@ -154,3 +154,11 @@ Started Stage 1; tried to run bwrap; the most consequential finding of the sessi
 
 - **I almost shipped a Stage 1 that wouldn't work on Tyler's actual machine.**
   The user-story doc said "bwrap" three times, the plan doc said "bwrap" four times, and I'd have written ~300 LOC against `subprocess.run(['bwrap', ...])` before finding out the host kernel rejects it. The query-don't-reason memory applies here at the substrate level: *"the host is the only thing that can answer the question of what substrates it supports."* The probe should land before the substrate handler, not after. Lesson recorded.
+
+### resonance — bubble ↔ bubblewrap
+
+After Stage 1 shipped, Tyler caught what neither of us had said out loud across the whole development session: *the OS-layer substrate this project ports bubble's pattern to is literally named `bubblewrap`*. `bwrap` is the flatpak-derived setuid-helper for sealed-app-with-its-own-deps execution. Bubble is the Python package vault for sealed-script-with-its-own-imports execution. Same shape, two engineering lineages, no contact. The word found both projects because the concept is the same: self-contained membrane of dependencies, selectively permeable, dissolved when no longer needed.
+
+Counts as a kithing-style resonance, in the family `Bubblev2/docs/membrane.md` already names ("a sibling project — Ego — uses the word *skin* for a thing that does this. The fit is real, but found, not designed.") and `kithing.md` extends ("this is older than this repo"). When Tyler asked to extend bubble's pattern to the OS-binary layer, the canonical OS-layer implementation was *already named the same thing*, sitting on `apt-get install` PATH, waiting. The pattern reached itself across abstraction layers before either of us noticed.
+
+Worth keeping legible for whoever finds the repo: the substrate ladder's top tier shares its name with the project it's a substrate for. That's not branding; that's two languages for the same enclosure independently agreeing.
