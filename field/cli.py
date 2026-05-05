@@ -18,7 +18,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import config, index, lineage, resolve as resolve_mod, scope as scope_mod, substrate as substrate_mod
+from . import config, index, lineage, resolve as resolve_mod, scope as scope_mod, substrate as substrate_mod, fault
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -79,9 +79,6 @@ def cmd_run(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 127
 
-    # Pick the substrate. Static binaries can short-circuit through 'direct'
-    # even on hosts that have bwrap; everything else routes to the best
-    # available isolation tier.
     menu = substrate_mod.read_host_portrait() or substrate_mod.probe()
     if res.mode == "static":
         chosen_substrate = "direct"
@@ -89,17 +86,91 @@ def cmd_run(args: argparse.Namespace) -> int:
         chosen_substrate = substrate_mod.best_substrate(menu)
 
     argv = [name, *args.argv]
-    try:
-        ec = substrate_mod.dispatch(chosen_substrate, snapshot_root, target, argv)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"field: dispatch failed via {chosen_substrate}: {exc}",
-              file=sys.stderr)
-        ec = 127
+
+    # Pre-augment with any lib dirs we've previously learned this binary
+    # needs. Look up by content sha if the index has it.
+    binary_sha = ""
+    for r in index.read_index():
+        if r.snapshot == res.snapshot and r.abspath == res.abspath:
+            binary_sha = r.sha256 or ""
+            break
+    extra_lib_dirs: list[Path] = list(fault.cached_extra_dirs(binary_sha, res.snapshot)) if binary_sha else []
+
+    target_for_log = f"{name}@{res.snapshot}{res.abspath}"
+    max_retries = 6
+    last_ec = 0
+    fault_loop_fired = False
+
+    for attempt in range(max_retries + 1):
+        try:
+            ec, captured = substrate_mod.dispatch(
+                chosen_substrate, snapshot_root, target, argv,
+                extra_lib_dirs=tuple(extra_lib_dirs),
+                capture_stderr=False,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"field: dispatch failed via {chosen_substrate}: {exc}",
+                  file=sys.stderr)
+            ec = 127
+            captured = ""
+        last_ec = ec
+
+        if ec == 0:
+            # Success. If we'd augmented this run, cache the resolution.
+            if fault_loop_fired and binary_sha:
+                for d in extra_lib_dirs:
+                    fault.cache_resolution(binary_sha, res.snapshot, d)
+                fault.record_fault("dispatch_succeeded_after_fault",
+                                   target_for_log,
+                                   f"extras={[str(d) for d in extra_lib_dirs]}")
+            break
+
+        # Re-run capturing stderr so we can parse for the ld.so signature.
+        # Done in a second invocation rather than a single tee'd run so the
+        # happy path stays free of capture overhead — same shape bubble's
+        # runner.py uses (lines 38-46).
+        ec_check, captured = substrate_mod.dispatch(
+            chosen_substrate, snapshot_root, target, argv,
+            extra_lib_dirs=tuple(extra_lib_dirs),
+            capture_stderr=True,
+        )
+        if ec_check == 0:
+            # Flaky between the two runs; treat as success.
+            break
+        # Surface what we captured so the user sees the binary's actual error
+        # if we can't recover.
+        sys.stderr.write(captured)
+        missing_lib = fault.parse_ld_so_error(captured)
+        if not missing_lib:
+            if attempt == 0 and captured.strip():
+                fault.record_fault("ld_so_error_unparseable", target_for_log,
+                                   detail=captured.splitlines()[0][:200])
+            break
+        lib_dir = fault.find_lib_in_snapshot(snapshot_root, missing_lib)
+        if lib_dir is None:
+            fault.record_fault("library_missing_in_snapshot", target_for_log,
+                               detail=f"lib={missing_lib}")
+            break
+        if lib_dir in extra_lib_dirs:
+            # Already added; same fault must mean we can't fix from here.
+            fault.record_fault("dispatch_loop_exhausted", target_for_log,
+                               detail=f"lib={missing_lib} already augmented; "
+                                      f"another fault still firing")
+            break
+        sys.stderr.write(
+            f"field: fault loop — adding {lib_dir} for {missing_lib}, retrying\n"
+        )
+        extra_lib_dirs.append(lib_dir)
+        fault_loop_fired = True
+    else:
+        # Loop exhausted without break (max_retries hit).
+        fault.record_fault("dispatch_loop_exhausted", target_for_log,
+                           detail=f"max_retries={max_retries}")
 
     lineage.record(name=name, snapshot=res.snapshot, abspath=res.abspath,
-                   mode=res.mode, argv=argv, cwd=cwd, exit_code=ec,
+                   mode=res.mode, argv=argv, cwd=cwd, exit_code=last_ec,
                    substrate=chosen_substrate)
-    return ec
+    return last_ec
 
 
 def cmd_log(args: argparse.Namespace) -> int:

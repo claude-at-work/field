@@ -106,54 +106,91 @@ def best_substrate(menu: SubstrateMenu, requested: Optional[str] = None) -> str:
 # ───────────────────────── dispatchers ─────────────────────────
 
 
-def dispatch_direct(target: Path, argv: list[str]) -> int:
-    """Stage 0's path. For statically-linked binaries; no env munging."""
-    pid = os.fork()
-    if pid == 0:
-        try:
-            os.execv(str(target), argv)
-        except OSError as exc:
-            sys.stderr.write(f"field: exec failed: {exc}\n")
-            os._exit(127)
-    _, status = os.waitpid(pid, 0)
-    return _exit_from_status(status)
+def dispatch_direct(target: Path, argv: list[str], *,
+                    capture_stderr: bool = False) -> tuple[int, str]:
+    """Stage 0's path. For statically-linked binaries; no env munging.
+    Returns (exit_code, captured_stderr) — same shape as the other
+    dispatchers so the fault loop can call any of them uniformly."""
+    if not capture_stderr:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.execv(str(target), argv)
+            except OSError as exc:
+                sys.stderr.write(f"field: exec failed: {exc}\n")
+                os._exit(127)
+        _, status = os.waitpid(pid, 0)
+        return _exit_from_status(status), ""
+    proc = subprocess.run([str(target), *argv[1:]],
+                          capture_output=True, text=True)
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+    return proc.returncode, proc.stderr or ""
 
 
-def dispatch_ld_library_path(snapshot_root: Path, target: Path,
-                             argv: list[str]) -> int:
-    """No-isolation fallback. LD_LIBRARY_PATH points at the snapshot's
-    library trees; everything else (/etc, /home, /proc) comes from host.
-
-    Works in environments that forbid bwrap (Termux/proot, some
-    containers). The binary sees a confused world — its libs are the
-    snapshot's, its config is the host's — but it runs."""
-    env = os.environ.copy()
+def _build_ld_path(snapshot_root: Path, extra_lib_dirs: tuple = ()) -> str:
+    """Compose LD_LIBRARY_PATH from the default snapshot lib roots, the
+    fault-loop's accumulated extras, and any host LD_LIBRARY_PATH."""
     libs = []
     for d in config.LIB_DIRS:
         p = snapshot_root / d
         if p.is_dir():
             libs.append(str(p))
-    existing = env.get("LD_LIBRARY_PATH", "")
-    env["LD_LIBRARY_PATH"] = ":".join(libs + ([existing] if existing else []))
-
-    pid = os.fork()
-    if pid == 0:
-        try:
-            os.execve(str(target), argv, env)
-        except OSError as exc:
-            sys.stderr.write(f"field: exec failed: {exc}\n")
-            os._exit(127)
-    _, status = os.waitpid(pid, 0)
-    return _exit_from_status(status)
+    for extra in extra_lib_dirs:
+        s = str(extra)
+        if s not in libs:
+            libs.append(s)
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    return ":".join(libs + ([existing] if existing else []))
 
 
-def dispatch_bwrap(snapshot_root: Path, target: Path, argv: list[str]) -> int:
+def dispatch_ld_library_path(snapshot_root: Path, target: Path,
+                             argv: list[str], *,
+                             extra_lib_dirs: tuple = (),
+                             capture_stderr: bool = False) -> tuple[int, str]:
+    """No-isolation fallback. LD_LIBRARY_PATH points at the snapshot's
+    library trees; everything else (/etc, /home, /proc) comes from host.
+
+    Works in environments that forbid bwrap (Termux/proot, some
+    containers). The binary sees a confused world — its libs are the
+    snapshot's, its config is the host's — but it runs.
+
+    Returns (exit_code, captured_stderr). When capture_stderr=False,
+    stderr passes through to the parent's tty and the second tuple
+    element is empty; the fault loop calls again with capture=True on
+    failure to inspect ld.so output."""
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = _build_ld_path(snapshot_root, extra_lib_dirs)
+    if not capture_stderr:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.execve(str(target), argv, env)
+            except OSError as exc:
+                sys.stderr.write(f"field: exec failed: {exc}\n")
+                os._exit(127)
+        _, status = os.waitpid(pid, 0)
+        return _exit_from_status(status), ""
+    proc = subprocess.run([str(target), *argv[1:]], env=env,
+                          capture_output=True, text=True)
+    # Print stdout to parent so the user still sees output even on capture path.
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+    return proc.returncode, proc.stderr or ""
+
+
+def dispatch_bwrap(snapshot_root: Path, target: Path, argv: list[str], *,
+                   extra_lib_dirs: tuple = (),
+                   capture_stderr: bool = False) -> tuple[int, str]:
     """Full mount-namespace isolation via bwrap. The dispatched binary
     sees /usr, /lib, /etc, /usr/share rooted at the snapshot, while
     /home, /tmp, /proc, /sys, /dev, $HOME come from the host shared rw.
 
-    The whole snapshot lib tree gets bind-mounted; per-binary subsets
-    are a Stage 4 concern (closure observation produces the data).
+    `extra_lib_dirs` are additional directories from the fault loop —
+    each becomes an additional --ro-bind so the in-namespace dynamic
+    linker can find them. The dirs are bind-mounted at their original
+    in-snapshot paths so they're discoverable on the standard
+    library search path.
     """
     bwrap_argv = ["bwrap", "--unshare-user", "--unshare-pid",
                   "--die-with-parent",
@@ -162,6 +199,10 @@ def dispatch_bwrap(snapshot_root: Path, target: Path, argv: list[str]) -> int:
         src = snapshot_root / d
         if src.is_dir():
             bwrap_argv += ["--ro-bind", str(src), "/" + d]
+    for extra in extra_lib_dirs:
+        if extra.is_dir() and snapshot_root in extra.parents:
+            in_ns = "/" + str(extra.relative_to(snapshot_root))
+            bwrap_argv += ["--ro-bind", str(extra), in_ns]
     home = os.environ.get("HOME") or "/root"
     if Path(home).is_dir():
         bwrap_argv += ["--bind", home, home]
@@ -169,26 +210,39 @@ def dispatch_bwrap(snapshot_root: Path, target: Path, argv: list[str]) -> int:
     if Path("/sys").is_dir():
         bwrap_argv += ["--ro-bind", "/sys", "/sys"]
 
-    # Where to mount the binary itself. bwrap's --ro-bind on the snapshot
-    # subtree should cover it if the binary lives under one of BIND_DIRS,
-    # but `target` may be at /<snapshot>/usr/bin/X — the in-namespace path
-    # is just /usr/bin/X. Compute and pass.
     in_ns_target = "/" + str(target.relative_to(snapshot_root))
     bwrap_argv += [in_ns_target] + argv
 
+    if capture_stderr:
+        proc = subprocess.run(bwrap_argv, capture_output=True, text=True)
+        if proc.stdout:
+            sys.stdout.write(proc.stdout)
+        return proc.returncode, proc.stderr or ""
     proc = subprocess.run(bwrap_argv)
-    return proc.returncode
+    return proc.returncode, ""
 
 
 def dispatch(substrate: str, snapshot_root: Path, target: Path,
-             argv: list[str]) -> int:
-    """Dispatch by substrate name. Single entry point for cli.py."""
+             argv: list[str], *,
+             extra_lib_dirs: tuple = (),
+             capture_stderr: bool = False) -> tuple[int, str]:
+    """Dispatch by substrate name. Returns (exit_code, captured_stderr).
+
+    `extra_lib_dirs` is the fault loop's accumulated set of directories
+    that need to be visible to the dynamic linker. Each substrate
+    interprets it differently (LD_LIBRARY_PATH for ld_library_path,
+    extra --ro-bind for bwrap, ignored for direct).
+    """
     if substrate == "bwrap":
-        return dispatch_bwrap(snapshot_root, target, argv)
+        return dispatch_bwrap(snapshot_root, target, argv,
+                              extra_lib_dirs=extra_lib_dirs,
+                              capture_stderr=capture_stderr)
     if substrate == "ld_library_path":
-        return dispatch_ld_library_path(snapshot_root, target, argv)
+        return dispatch_ld_library_path(snapshot_root, target, argv,
+                                        extra_lib_dirs=extra_lib_dirs,
+                                        capture_stderr=capture_stderr)
     if substrate == "direct":
-        return dispatch_direct(target, argv)
+        return dispatch_direct(target, argv, capture_stderr=capture_stderr)
     raise ValueError(f"unknown / unimplemented substrate: {substrate!r}")
 
 
