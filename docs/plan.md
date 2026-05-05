@@ -16,24 +16,32 @@ The build order. Each stage proves a property the next depends on. Stages are no
 
 **Done when**: a missing static binary in the new root resolves to a snapshot binary on first try, runs, and shows up in the lineage log.
 
-## stage 1 — dynamic-binary substrate via bwrap (with multi-candidate UX)
+## stage 1 — dynamic-binary substrate **ladder** (with multi-candidate UX)
 
 **Proves**: substrate ladder works at OS layer; `Decision`/`record_failure` shape ports from bubble's `route.py`; the dispatcher produces transparent-on-miss UX on the common case.
 
 **User story + success criterion**: see `docs/stage1.md`. The story is the criterion the implementation answers to.
 
-**Structural shift from the original plan**: multi-candidate UX (originally Stage 3) is folded into Stage 1. The user story makes this mandatory — punting it produces a dispatcher that silently picks the wrong `python3` the first time the user has two installed, which is the common case on a real machine. Scope-per-cwd-prefix lands at the same time.
+**Two structural shifts from the original plan:**
+
+1. **Multi-candidate UX folded in** (originally Stage 3): the user story makes this mandatory — punting it produces a dispatcher that silently picks the wrong `python3` the first time the user has two installed.
+2. **Substrate is a ladder, not a single mechanism** (notebook entry 2026-05-05): the design phase planned around bwrap as the substrate, but bwrap requires user namespaces — Tyler's actual machine (Termux/proot) doesn't have them. The fix is to ship a ladder, port `bubble/route.py:39`'s `SUBSTRATE_LADDER` shape:
+    1. `bwrap` — full mount-namespace isolation. Requires user namespaces or setuid bwrap.
+    2. `proot` — userspace path translation. (Stage 1.5; not shipped initially.)
+    3. `ld_library_path` — direct exec with `LD_LIBRARY_PATH` set. No isolation; works almost anywhere.
+    4. `direct` — Stage 0's path; static binaries only.
+   Field probes the host once, picks the highest available, records to `~/.field/host.toml`.
 
 **Scope**:
-- Detect `mode=dynamic` from the index.
-- `bwrap` invocation builder: bind-mount `<snapshot>/{usr/lib,usr/lib64,lib,lib64,usr/share,etc,usr/libexec}` ro into a fresh mount namespace; share `/home`, `/tmp`, `/proc`, `/sys`, `/dev`, `$HOME` rw from host.
+- Host probe at startup: detect bwrap availability (`bwrap --unshare-user --proc /proc /usr/bin/true`), proot availability, write `host.toml` with the substrate menu.
+- Substrate handlers in `field/substrate/`: `bwrap.py`, `ld_library_path.py`. Each exposes `is_available()`, `dispatch(snapshot_root, target_abspath, argv) -> exit_code`.
 - Multi-candidate interactive prompt: when index has >1 candidate (after content-hash dedup), show snapshot + last-seen-context, pick one.
 - Scope memory at `~/.field/scopes.toml`, keyed by `(name, cwd-prefix)`. Subsequent invocations under the prefix skip the prompt.
-- Lineage records `substrate=bwrap` plus the namespace argv hash.
+- Lineage records `substrate=<actual>` plus a hash of the dispatch argv.
 
-**Out of stage 1**: fault-loop closure expansion (Stage 2), strace-based observation (Stage 4), pid/user/network-namespace isolation (only mount-namespace ships in Stage 1), selective per-binary bind-mount subsets (Stage 4 produces the data; Stage 1 mounts the whole snapshot lib tree).
+**Out of stage 1**: fault-loop closure expansion (Stage 2), strace-based observation (Stage 4), pid/user/network-namespace isolation (mount-namespace via bwrap is best-tier; degraded substrates ship without isolation), selective per-binary bind-mount subsets (Stage 4 produces the data; Stage 1 mounts the whole snapshot lib tree where it can mount at all).
 
-**Done when**: the 5-step manual test in `stage1.md` passes end-to-end.
+**Done when**: the 5-step manual test in `stage1.md` passes end-to-end on this host (using whichever substrate is highest-available; expected `ld_library_path` on Tyler's Termux/proot).
 
 ## stage 2 — fault loop for closure expansion
 

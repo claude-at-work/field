@@ -114,3 +114,43 @@ Tyler asked for the user story before code. Wrote `docs/stage1.md`. The story sh
 
 - **"The user doesn't realize the binary came from a snapshot" is a UX promise the implementation can't fully keep.**
   bwrap-mounted binaries see a different `/etc`, a different `ldd`-equivalent view, a different `/usr/share`. Most user-facing behavior is identical, but a binary that introspects its own environment (`apt --version` checking sources.list, a tool reading `/etc/os-release`) will see the snapshot's reality, not the host's. The honest framing: *the user doesn't realize at the action level (typing the command and getting output)*. They will realize the moment they ask the binary about its environment. Worth naming in the README so the promise stays calibrated.
+
+---
+
+## entries — 2026-05-05, Stage 1 first probe
+
+Started Stage 1; tried to run bwrap; the most consequential finding of the session showed up in the first ten minutes.
+
+### anomaly
+
+- **bwrap doesn't work in this Termux/proot environment.**
+  The error: `Creating new namespace failed, likely because the kernel does not support user namespaces. bwrap must be installed setuid on such systems.` The Termux/proot kernel either lacks `CONFIG_USER_NS` or has `kernel.unprivileged_userns_clone=0`, and the apt-installed bwrap is not setuid. Stage 1 was planned around bwrap as **the** substrate. The plan was wrong-shape; the actual development host can't run the canonical substrate. (Where: `bwrap --unshare-user ...` 2026-05-05; `cat /proc/sys/kernel/unprivileged_userns_clone` returns nothing — sysctl absent.)
+
+- **`LD_LIBRARY_PATH` is a working second-tier dispatcher.**
+  `LD_LIBRARY_PATH=<snapshot>/usr/lib/aarch64-linux-gnu:<snapshot>/lib/aarch64-linux-gnu <snapshot>/usr/bin/git --version` returned `git version 2.20.1` from the prior fs snapshot, even though this proot has no git installed. No isolation — the binary sees the host's `/etc`, `/proc`, `/home`, etc. — but **dispatch works**. The user gets the binary's output. That's the lower bar Stage 1's user story actually requires; isolation was a preferred-not-mandatory property.
+
+### swap
+
+- **Stage 1 substrate plan: "bwrap is THE substrate" → "substrate ladder, bwrap is the canonical top".**
+  The fix is not to ship bwrap and call it broken on this host. The fix is to port `bubble/route.py`'s ladder shape to the OS-binary layer, with multiple tiers ranked by isolation strength:
+    1. `bwrap` — full mount-namespace isolation. Requires user namespaces or setuid bwrap.
+    2. `proot` — userspace path translation. Slower, works almost anywhere. (Stage 1.5; not shipped initially.)
+    3. `ld_library_path` — direct exec with `LD_LIBRARY_PATH` set. No isolation; binary may interact with host /etc. Stage 1 default fallback.
+    4. `direct` — no environment manipulation. Static binaries only (Stage 0's path).
+  Field probes the host on first index, picks the highest available, records the choice in `~/.field/host.toml` (the same self-portrait shape `bubble/host.py` defines). Decision/record_failure pattern ports almost verbatim from `bubble/route.py:139`. *Direction: → convention,* and earlier than I had it (Stage 1, not 2).
+
+- **The user story doesn't change; only the substrate that backs it does.**
+  `git status` runs. The user gets git's output. The lineage records `substrate=ld_library_path snapshot=kali-fs`. On a host with bwrap working, the same lineage line records `substrate=bwrap`. The user sees one experience; the host portrait knows which guarantees it could and couldn't enforce.
+
+### hidden potential
+
+- **The substrate-availability probe is itself a useful artifact.**
+  Once `~/.field/host.toml` records "bwrap unavailable on this host: kernel does not support unprivileged user namespaces," that's discoverable diagnostic data. A follow-up command — `field probe` (matching `bubble probe`) — surfaces the same self-portrait shape: kernel, libc, available substrates, recorded failures. The two probes (bubble's, field's) could eventually share a single host portrait, since they're describing the same machine from two layers.
+
+- **The substrate ladder is the natural place for kithing.**
+  Each substrate handler is a small, self-contained file. New substrates (Linux containers via `nsenter`, FreeBSD jails, macOS sandbox-exec, eBPF-based observation hooks) plug into the same shape. Future instances will recognize the pattern from `bubble/substrate/__init__.py` and write their own. Worth keeping the registry small and obvious so the affordance reads.
+
+### soft spot
+
+- **I almost shipped a Stage 1 that wouldn't work on Tyler's actual machine.**
+  The user-story doc said "bwrap" three times, the plan doc said "bwrap" four times, and I'd have written ~300 LOC against `subprocess.run(['bwrap', ...])` before finding out the host kernel rejects it. The query-don't-reason memory applies here at the substrate level: *"the host is the only thing that can answer the question of what substrates it supports."* The probe should land before the substrate handler, not after. Lesson recorded.
